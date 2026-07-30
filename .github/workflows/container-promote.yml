@@ -1,0 +1,326 @@
+# Reusable: promote an already-built image to production by re-tagging the
+# manifest staging validated, then writing that tag into production's values.
+#
+# This is the PRODUCTION half of the release model (ADR 0005). It deliberately
+# does NOT rebuild. A rebuild of the same source can differ from what staging
+# ran — base image moved, a floating dependency resolved differently — which
+# would make "staging tested it" untrue at the only moment it matters. Re-tagging
+# an existing manifest gives production the identical digest, byte for byte.
+#
+# Caller (app repo .github/workflows/deploy.yml):
+#
+#   jobs:
+#     production:
+#       if: github.ref_type == 'tag'
+#       uses: bitovi/platform-ci/.github/workflows/container-promote.yml@0.0.1
+#       permissions:
+#         id-token: write
+#         contents: write
+#         actions: write
+#       with:
+#         values-file: deploy/values.yaml
+#       secrets: inherit
+#
+# What gets promoted is whatever tag staging's values file currently carries —
+# NOT the tagged commit's SHA. Every staging deploy writes a
+# `chore(staging): ...` commit, so main's HEAD is usually a write-back commit
+# whose own SHA was never built; resolving from the values file is both
+# correct and what "promote what staging validated" means. If that image is
+# missing the run FAILS rather than silently building one.
+#
+# No IAM change is needed: the app's existing ECR push policy already grants
+# ecr:BatchGetImage and ecr:PutImage.
+
+name: Container promote
+
+on:
+  workflow_call:
+    inputs:
+      values-file:
+        description: "Values file whose image.tag is updated (e.g. deploy/values.yaml)."
+        required: true
+        type: string
+      source-values-file:
+        description: >
+          Values file to read the promoted tag from — normally staging's, so
+          the release ships exactly what staging is running.
+        required: false
+        type: string
+        default: deploy/values.staging.yaml
+      source-tag:
+        description: >
+          Explicit image tag to promote. Overrides source-values-file; use it
+          to re-promote a specific older build.
+        required: false
+        type: string
+        default: ""
+      target-tag:
+        description: "Tag to apply to the promoted manifest. Defaults to the git tag name."
+        required: false
+        type: string
+        default: ""
+      deploy-branch:
+        required: false
+        type: string
+        default: main
+      environment-label:
+        required: false
+        type: string
+        default: release
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      image-tag-path:
+        description: >
+          yq path the tag lives at — READ from source-values-file to learn what
+          staging runs, and WRITTEN to values-file to deploy it. One input
+          serves both because an app's two environment files share a format.
+          Defaults to the legacy values format, where image.tag sits at the
+          root. An app interface file keeps the tag on the workload, so those
+          callers pass .workloads.<key>.image.tag — writing to the root there
+          would add a top-level `image` key the interface schema rejects,
+          leaving the workload's own tag empty.
+        required: false
+        type: string
+        default: .image.tag
+      writeback-app-id:
+        description: >
+          GitHub App ID used to mint a token for the values write-back. Needed
+          wherever a ruleset requires pull requests on the deploy branch: such
+          rulesets bypass only OrganizationAdmin and Integration actors, so
+          GITHUB_TOKEN cannot push there and an App token must. Omit to use
+          GITHUB_TOKEN.
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+    secrets:
+      ECR_PUSH_ROLE_ARN:
+        required: true
+      ECR_REPOSITORY:
+        required: true
+      CI_WRITEBACK_APP_PRIVATE_KEY:
+        description: >
+          Private key for writeback-app-id. Named to match the organization's
+          existing CI_WRITEBACK_APP_ID / CI_WRITEBACK_APP_PRIVATE_KEY pair, so
+          `secrets: inherit` carries it with no per-caller mapping. Required
+          when writeback-app-id is set.
+        required: false
+    outputs:
+      image-digest:
+        description: "Digest of the promoted manifest — compare against the running staging pod."
+        value: ${{ jobs.promote.outputs.image-digest }}
+
+jobs:
+  promote:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      target-tag: ${{ steps.resolve.outputs.target }}
+      image-digest: ${{ steps.retag.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tags
+        id: resolve
+        env:
+          SOURCE: ${{ inputs.source-tag }}
+          SOURCE_FILE: ${{ inputs.source-values-file }}
+          TAG_PATH: ${{ inputs.image-tag-path }}
+          TARGET: ${{ inputs.target-tag }}
+          REPO_URI: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          # The source is what STAGING IS RUNNING, read from its values file —
+          # deliberately not $GITHUB_SHA. Each staging deploy writes a
+          # `chore(staging): ...` commit, so main's HEAD (and therefore the
+          # commit a release tag usually points at) is a write-back commit
+          # whose own SHA was never built. Reading the tag staging runs is both
+          # correct and what "promote what staging validated" actually means.
+          if [ -n "$SOURCE" ]; then
+            RESOLVED="$SOURCE"
+            echo "::notice::Promoting explicitly requested tag $RESOLVED"
+          elif [ -f "$SOURCE_FILE" ]; then
+            # Distinguish "wrong path for this file's format" from "staging
+            # genuinely hasn't deployed". Both read as an absent tag, but only
+            # one is the app's fault, and conflating them sends you looking at
+            # staging when the caller is misconfigured.
+            PARENT="${TAG_PATH%.*}"
+            if ! yq -e "${PARENT}" "$SOURCE_FILE" >/dev/null 2>&1; then
+              echo "::error::$SOURCE_FILE has no ${PARENT}, so ${TAG_PATH} can't be the tag staging runs."
+              echo "Wrong image-tag-path for this file's format? Legacy values use .image.tag; an app interface file uses .workloads.<key>.image.tag."
+              exit 1
+            fi
+            RESOLVED=$(TAG_PATH="$TAG_PATH" yq -r 'eval(strenv(TAG_PATH)) // ""' "$SOURCE_FILE")
+            if [ -z "$RESOLVED" ] || [ "$RESOLVED" = "null" ]; then
+              echo "::error::$SOURCE_FILE has no ${TAG_PATH} — staging has not deployed anything yet, so there is nothing validated to promote."
+              exit 1
+            fi
+            echo "::notice::Promoting $RESOLVED (currently deployed to staging per $SOURCE_FILE)"
+          else
+            echo "::error::$SOURCE_FILE not found and no source-tag given."
+            echo "An app with no staging environment should call container-build.yml on its release tag instead of promoting."
+            exit 1
+          fi
+
+          echo "source=$RESOLVED" >> "$GITHUB_OUTPUT"
+          echo "target=${TARGET:-$GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          # ECR_REPOSITORY is the full URI; the CLI wants the bare repo name.
+          echo "name=${REPO_URI##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Re-tag the validated manifest
+        id: retag
+        env:
+          REPO: ${{ steps.resolve.outputs.name }}
+          SOURCE: ${{ steps.resolve.outputs.source }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          # batch-get-image both proves the image exists and returns the
+          # manifest, in one call the push policy already allows. (describe-images
+          # would read more naturally but ecr:DescribeImages is NOT granted.)
+          #
+          # Parsed with jq, not `read`: the manifest is a JSON document and
+          # word-splitting it on whitespace would silently truncate it.
+          IMAGES=$(aws ecr batch-get-image \
+            --repository-name "$REPO" \
+            --image-ids "imageTag=$SOURCE" \
+            --output json)
+          MANIFEST=$(jq -r '.images[0].imageManifest // empty' <<<"$IMAGES")
+          MEDIA_TYPE=$(jq -r '.images[0].imageManifestMediaType // empty' <<<"$IMAGES")
+
+          if [ -z "$MANIFEST" ]; then
+            echo "::error::No image tagged '$SOURCE' in $REPO — nothing to promote."
+            echo "Production promotes the artifact staging already ran, so this release"
+            echo "cannot proceed with an unbuilt commit. Either tag a commit that reached"
+            echo "main (and was therefore built by container-build.yml), or pass"
+            echo "source-tag explicitly to promote a different, already-built image."
+            exit 1
+          fi
+
+          # Re-tagging an identical manifest is a no-op that AWS reports as an
+          # error; a genuine failure must still fail the release.
+          if OUT=$(aws ecr put-image \
+                --repository-name "$REPO" \
+                --image-tag "$TARGET" \
+                --image-manifest "$MANIFEST" \
+                --image-manifest-media-type "$MEDIA_TYPE" 2>&1); then
+            echo "::notice::Tagged $REPO:$SOURCE as $TARGET"
+          elif grep -q 'ImageAlreadyExistsException' <<<"$OUT"; then
+            echo "::notice::$REPO:$TARGET already points at this manifest — continuing."
+          else
+            echo "$OUT" >&2
+            exit 1
+          fi
+
+          DIGEST=$(aws ecr batch-get-image \
+            --repository-name "$REPO" \
+            --image-ids "imageTag=$TARGET" \
+            --query 'images[0].imageId.imageDigest' --output text)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "::notice::$REPO:$TARGET -> $DIGEST"
+
+  # Inlined rather than shared with container-build.yml — see the note there.
+  write-back:
+    needs: [promote]
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      # A ruleset that requires pull requests on the deploy branch blocks
+      # GITHUB_TOKEN from pushing; a GitHub App is an Integration bypass actor
+      # and can. Skipped entirely when no app is configured.
+      - name: Mint an App token for the write-back
+        if: inputs.writeback-app-id != ''
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ inputs.writeback-app-id }}
+          private-key: ${{ secrets.CI_WRITEBACK_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.deploy-branch }}
+          # The push below reuses these credentials.
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Write image tag into ${{ inputs.values-file }}
+        env:
+          TAG: ${{ needs.promote.outputs.target-tag }}
+          TAG_PATH: ${{ inputs.image-tag-path }}
+          FILE: ${{ inputs.values-file }}
+        run: |
+          test -f "$FILE" || { echo "::error::$FILE does not exist on ${{ inputs.deploy-branch }}"; exit 1; }
+          # Check the file has this shape BEFORE writing. yq creates missing
+          # keys rather than failing, so a path meant for another values format
+          # silently adds a new branch and leaves the real tag untouched —
+          # which is exactly how a legacy .image.tag write into an app
+          # interface file produced a stray top-level `image` key and a
+          # workload with no tag. Verifying the value afterwards cannot catch
+          # that: the key it just invented reads back fine. The PARENT is what
+          # must already exist.
+          PARENT="${TAG_PATH%.*}"
+          if ! yq -e "${PARENT}" "$FILE" >/dev/null 2>&1; then
+            echo "::error::$FILE has no ${PARENT}, so writing ${TAG_PATH} would add a new key instead of setting the image tag."
+            echo "Wrong image-tag-path for this file's format? Legacy values use .image.tag; an app interface file uses .workloads.<key>.image.tag."
+            exit 1
+          fi
+          yq -i "${TAG_PATH} = strenv(TAG)" "$FILE"
+
+      - name: Commit and push (rebase-and-retry on races)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          FILE: ${{ inputs.values-file }}
+          BRANCH: ${{ inputs.deploy-branch }}
+          TAG: ${{ needs.promote.outputs.target-tag }}
+          TAG_PATH: ${{ inputs.image-tag-path }}
+          ENVIRONMENT: ${{ inputs.environment-label }}
+        run: |
+          if [ -n "${APP_SLUG}" ]; then
+            git config user.name "${APP_SLUG}[bot]"
+            git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fi
+
+          git add "$FILE"
+          if git diff --cached --quiet; then
+            echo "::notice::${TAG_PATH} in $FILE is already $TAG — nothing to deploy; cancelling."
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+            gh run watch "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+            exit 1
+          fi
+
+          # Marked rather than [skip ci]: see container-build.yml. A promotion
+          # write-back also lands on the deploy branch, so it must not start a
+          # staging build either.
+          git commit -m "chore(${ENVIRONMENT}): deploy ${TAG} [deploy-writeback]"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${BRANCH}"; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); rebasing and retrying..."
+            git fetch origin "$BRANCH"
+            git rebase "origin/${BRANCH}"
+            sleep $((attempt * 2))
+          done
+          echo "::error::Failed to push the write-back after 5 attempts."
+          exit 1
