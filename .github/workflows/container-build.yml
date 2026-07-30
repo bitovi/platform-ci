@@ -71,17 +71,6 @@ on:
         required: false
         type: string
         default: us-east-1
-      aws-account-id:
-        description: >
-          Account hosting the app's ECR repository and push role. Used only to
-          derive their names when the ESO-pushed secrets are absent — first
-          provisioning, and repos ESO cannot reach. Normally the secrets carry
-          both and this goes unused. Pass
-          `vars.BITOVI_PLATFORM_AWS_ACCOUNT_ID` rather than a literal, so the
-          account number stays out of app repos and out of this one.
-        required: false
-        type: string
-        default: ""
       app-name:
         description: "Platform app name. Defaults to the repository name, which is the convention."
         required: false
@@ -132,6 +121,15 @@ on:
       ECR_PUSH_ROLE_ARN:
         required: false
       ECR_REPOSITORY:
+        required: false
+      BITOVI_PLATFORM_AWS_ACCOUNT_ID:
+        description: >
+          Account hosting the app's ECR repository and push role, used to derive
+          their names when the two above are absent. A secret rather than an
+          input so it is masked in logs and never written into an app's
+          workflow; org-level, so `secrets: inherit` carries it with no
+          per-caller mapping. A caller passing an explicit `secrets:` block
+          instead of inheriting has to map it through.
         required: false
       CI_WRITEBACK_APP_PRIVATE_KEY:
         description: >
@@ -193,7 +191,7 @@ jobs:
           SECRET_ROLE: ${{ secrets.ECR_PUSH_ROLE_ARN }}
           SECRET_REPO: ${{ secrets.ECR_REPOSITORY }}
           APP: ${{ inputs.app-name }}
-          ACCOUNT: ${{ inputs.aws-account-id }}
+          ACCOUNT: ${{ secrets.BITOVI_PLATFORM_AWS_ACCOUNT_ID }}
           REGION: ${{ inputs.aws-region }}
         run: |
           set -euo pipefail
@@ -203,8 +201,8 @@ jobs:
           # and the run fails several steps later looking like a credentials
           # problem instead of a missing input.
           if { [ -z "$SECRET_ROLE" ] || [ -z "$SECRET_REPO" ]; } && [ -z "$ACCOUNT" ]; then
-            echo "::error::ECR_PUSH_ROLE_ARN/ECR_REPOSITORY are not set yet, and no aws-account-id was given, so the convention names cannot be derived."
-            echo "Pass aws-account-id (normally vars.BITOVI_PLATFORM_AWS_ACCOUNT_ID), or wait for the app's Argo CD Application to push both secrets and re-run."
+            echo "::error::ECR_PUSH_ROLE_ARN/ECR_REPOSITORY are not set yet, and BITOVI_PLATFORM_AWS_ACCOUNT_ID was not passed, so the convention names cannot be derived."
+            echo "Set the org secret BITOVI_PLATFORM_AWS_ACCOUNT_ID and pass it (secrets: inherit does), or wait for the app's Argo CD Application to push both secrets and re-run."
             exit 1
           fi
           ROLE="${SECRET_ROLE:-arn:aws:iam::${ACCOUNT}:role/platform-managed/${APP}-github-ecr-push}"

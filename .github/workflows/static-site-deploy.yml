@@ -36,6 +36,9 @@
 #         SITE_DEPLOY_ROLE_ARN: ${{ secrets.STAGING_SITE_DEPLOY_ROLE_ARN }}
 #         SITE_BUCKET: ${{ secrets.STAGING_SITE_BUCKET }}
 #         CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.STAGING_CLOUDFRONT_DISTRIBUTION_ID }}
+#         # An explicit block replaces `secrets: inherit`, so the account has
+#         # to be mapped through too — it is not environment-specific.
+#         BITOVI_PLATFORM_AWS_ACCOUNT_ID: ${{ secrets.BITOVI_PLATFORM_AWS_ACCOUNT_ID }}
 #
 # Mapping at the call site rather than selecting inside keeps which secret an
 # environment uses visible in the app's own workflow.
@@ -106,16 +109,6 @@ on:
         required: false
         type: string
         default: us-east-1
-      aws-account-id:
-        description: >
-          Account hosting the site's bucket and deploy role. Used only to derive
-          their names when the ESO-pushed secrets are absent — normally the
-          secrets carry both and this goes unused. Pass
-          `vars.BITOVI_PLATFORM_AWS_ACCOUNT_ID` rather than a literal, so the
-          account number stays out of app repos and out of this one.
-        required: false
-        type: string
-        default: ""
       cluster-name:
         description: "Bucket-name prefix; must match aws.clusterName in charts/platform-api."
         required: false
@@ -137,6 +130,16 @@ on:
         required: false
       CLOUDFRONT_DISTRIBUTION_ID:
         required: true
+      BITOVI_PLATFORM_AWS_ACCOUNT_ID:
+        description: >
+          Account hosting the site's bucket and deploy role, used to derive their
+          names when the role and bucket above are absent. A secret rather than
+          an input so it is masked in logs and never written into an app's
+          workflow; org-level, so `secrets: inherit` carries it with no
+          per-caller mapping. The staging example above passes an explicit
+          `secrets:` block, which replaces inheritance — so it maps this through
+          by hand.
+        required: false
 
 jobs:
   deploy:
@@ -155,7 +158,7 @@ jobs:
           DIST: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
           APP: ${{ inputs.app-name }}
           ENVIRONMENT: ${{ inputs.environment }}
-          ACCOUNT: ${{ inputs.aws-account-id }}
+          ACCOUNT: ${{ secrets.BITOVI_PLATFORM_AWS_ACCOUNT_ID }}
           CLUSTER: ${{ inputs.cluster-name }}
         run: |
           set -euo pipefail
@@ -175,8 +178,8 @@ jobs:
           # a bucket with an empty segment, failing later as a credentials or
           # not-found error instead of a missing input.
           if { [ -z "$SECRET_ROLE" ] || [ -z "$SECRET_BUCKET" ]; } && [ -z "$ACCOUNT" ]; then
-            echo "::error::SITE_DEPLOY_ROLE_ARN/SITE_BUCKET are not set yet, and no aws-account-id was given, so the convention names cannot be derived."
-            echo "Pass aws-account-id (normally vars.BITOVI_PLATFORM_AWS_ACCOUNT_ID), or wait for the site's Argo CD Application to push both secrets and re-run."
+            echo "::error::SITE_DEPLOY_ROLE_ARN/SITE_BUCKET are not set yet, and BITOVI_PLATFORM_AWS_ACCOUNT_ID was not passed, so the convention names cannot be derived."
+            echo "Set the org secret BITOVI_PLATFORM_AWS_ACCOUNT_ID and pass it (secrets: inherit does), or wait for the site's Argo CD Application to push both secrets and re-run."
             exit 1
           fi
 

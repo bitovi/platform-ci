@@ -58,9 +58,15 @@ jobs:
 ```
 
 `secrets: inherit` is the intended way to pass credentials — it forwards
-`ECR_PUSH_ROLE_ARN`, `ECR_REPOSITORY`, and `CI_WRITEBACK_APP_PRIVATE_KEY`
-with no per-caller mapping. It forwards only what the calling repo can
-actually see.
+`ECR_PUSH_ROLE_ARN`, `ECR_REPOSITORY`, `CI_WRITEBACK_APP_PRIVATE_KEY`, and
+`BITOVI_PLATFORM_AWS_ACCOUNT_ID` with no per-caller mapping. It forwards only
+what the calling repo can actually see, so an org-level secret scoped to
+private repositories will not reach a public one.
+
+An explicit `secrets:` block **replaces** inheritance rather than adding to it,
+so a caller that maps any secret by hand — as the static-site staging job does
+for its `STAGING_`-prefixed values — must map every secret it needs, including
+`BITOVI_PLATFORM_AWS_ACCOUNT_ID`.
 
 Apps with no staging environment call `container-build.yml` on the release tag
 directly and skip promotion.
