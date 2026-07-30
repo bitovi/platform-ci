@@ -81,3 +81,19 @@ While the series is `0.0.x` every tag may carry a breaking change, so read the
 release notes before bumping a pin rather than assuming the increment is safe.
 Changes worth that caution are a new required input, a removed input, and a
 changed default that moves where the image tag is written.
+
+Because a tag here publishes code to every app that pins it, tagging is treated
+as a release action rather than a bookmark:
+
+- **Tags are immutable.** A ruleset blocks updating and deleting them, so an
+  existing pin can never be repointed at different code. Cleanup of a bad tag
+  is an org-admin bypass, deliberately.
+- **A tag's commit must be on `main`** — `verify-release-tag.yml` fails any tag
+  pointing at something that was never merged. It runs after the tag exists, so
+  it catches mistakes rather than preventing them; immutability is what protects
+  apps already pinned.
+
+Write access to this repo is not the same thing as permission to deploy the
+fleet, which is what those two rules are for. Pinning a commit SHA instead of a
+tag sidesteps tag handling entirely, and is the tightest option available to a
+caller.
