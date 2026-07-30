@@ -76,9 +76,9 @@ on:
           Account hosting the app's ECR repository and push role. Used only to
           derive their names when the ESO-pushed secrets are absent — first
           provisioning, and repos ESO cannot reach. Normally the secrets carry
-          both and this goes unused. Pass `vars.AWS_ACCOUNT_ID` rather than a
-          literal, so the account number stays out of app repos and out of
-          this one.
+          both and this goes unused. Pass
+          `vars.BITOVI_PLATFORM_AWS_ACCOUNT_ID` rather than a literal, so the
+          account number stays out of app repos and out of this one.
         required: false
         type: string
         default: ""
@@ -204,7 +204,7 @@ jobs:
           # problem instead of a missing input.
           if { [ -z "$SECRET_ROLE" ] || [ -z "$SECRET_REPO" ]; } && [ -z "$ACCOUNT" ]; then
             echo "::error::ECR_PUSH_ROLE_ARN/ECR_REPOSITORY are not set yet, and no aws-account-id was given, so the convention names cannot be derived."
-            echo "Pass aws-account-id (normally vars.AWS_ACCOUNT_ID), or wait for the app's Argo CD Application to push both secrets and re-run."
+            echo "Pass aws-account-id (normally vars.BITOVI_PLATFORM_AWS_ACCOUNT_ID), or wait for the app's Argo CD Application to push both secrets and re-run."
             exit 1
           fi
           ROLE="${SECRET_ROLE:-arn:aws:iam::${ACCOUNT}:role/platform-managed/${APP}-github-ecr-push}"
