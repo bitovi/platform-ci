@@ -32,6 +32,9 @@
 #         build-dir: out
 #         build-env: |
 #           NEXT_PUBLIC_API_BASE_URL=https://pto-api-staging.bitovi-tools.com
+#         # If the build isn't at the repo root (e.g. ui/package.json +
+#         # ui/package-lock.json with install-command: npm --prefix ui ci),
+#         # pass cache-dependency-path
 #       secrets:
 #         SITE_DEPLOY_ROLE_ARN: ${{ secrets.STAGING_SITE_DEPLOY_ROLE_ARN }}
 #         SITE_BUCKET: ${{ secrets.STAGING_SITE_BUCKET }}
@@ -105,6 +108,14 @@ on:
         required: false
         type: string
         default: "20"
+      cache-dependency-path:
+        description: >
+          Path to the lockfile(s) for setup-node's cache key (e.g.
+          ui/package-lock.json). Needed when the build isn't at the repo root.
+          Empty (the default) searches for a lockfile at the repo root.
+        required: false
+        type: string
+        default: ""
       aws-region:
         required: false
         type: string
@@ -206,6 +217,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
