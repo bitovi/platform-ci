@@ -1,0 +1,76 @@
+# Fails a tag whose commit never reached main.
+#
+# Apps pin tags of this repo, so creating one is a release action, not a
+# bookmark. This refuses a tag pointing at anything that wasn't merged — a
+# branch build, a rebased commit, a fork — so a published version can only ever
+# contain reviewed code.
+#
+# Two things it deliberately does NOT do, so nobody over-trusts it:
+#
+# - It runs AFTER the tag exists. For the seconds until this fails, the tag
+#   resolves and a caller pinning it would work. Small window, not zero.
+# - A tag pushed from a branch that deleted this file runs no check at all. A
+#   workflow cannot police its own integrity: whoever controls the ref controls
+#   the check.
+#
+# Neither is load-bearing, because the control that actually protects apps is
+# the tag ruleset blocking update and deletion. Immutable tags mean an existing
+# pin can never be repointed at new code, so even a malicious NEW tag reaches
+# nothing until some app repo changes its pin — a reviewed change, in that
+# repo, by someone with write access to it. This check is the cheap layer that
+# catches mistakes and casual misuse; immutability is the layer that stops the
+# attack.
+#
+# On failure the tag is left in place rather than deleted. Deletion is blocked
+# by that same ruleset, so cleanup is an org-admin bypass either way, and
+# failing loudly with the tag intact audits better than a workflow that quietly
+# removes things.
+
+name: Verify release tag
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: read
+
+jobs:
+  ancestry:
+    name: Tag commit is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # merge-base needs the tagged commit and main's history, not just the
+          # single commit a tag push would otherwise fetch.
+          fetch-depth: 0
+
+      - name: Check the tagged commit is an ancestor of main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Explicit refspec rather than `git fetch origin main`: this creates
+          # the remote-tracking ref regardless of how checkout configured the
+          # remote, so `origin/main` is guaranteed to resolve below.
+          git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+
+          # A commit is its own ancestor, so tagging main's tip passes — and so
+          # does tagging an older main commit, which keeps backfilling a release
+          # from history possible.
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::notice::$TAG -> ${GITHUB_SHA:0:8} is on main."
+            exit 0
+          fi
+
+          echo "::error::Tag $TAG points at ${GITHUB_SHA:0:8}, which is not on main."
+          echo "Apps pin tags of this repo, so a tag publishes code to the fleet. Its commit"
+          echo "has to be reviewed and merged first — merge the change, then tag the merge"
+          echo "commit."
+          echo ""
+          echo "This tag has been left in place. Removing it needs an org-admin bypass of the"
+          echo "tag ruleset, so ask the platform team rather than re-tagging around it."
+          exit 1

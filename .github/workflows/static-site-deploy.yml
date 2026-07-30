@@ -1,0 +1,313 @@
+# Reusable: build a static site, sync it to its S3 bucket, and invalidate
+# CloudFront.
+#
+# Unlike a container app there is no image and no tag — the S3 sync IS the
+# deploy, and Argo CD is not in the path at all (the platform composes the
+# bucket/distribution/cert; CI only writes objects). So there is nothing to
+# promote by digest: each environment builds and uploads its own copy. See
+# "Promotion" below for why, and what it would take to change.
+#
+# Caller (app repo .github/workflows/deploy.yml), production only:
+#
+#   jobs:
+#     production:
+#       uses: bitovi/platform-ci/.github/workflows/static-site-deploy.yml@0.0.1
+#       permissions:
+#         id-token: write
+#         contents: read
+#       with:
+#         build-dir: out
+#       secrets: inherit
+#
+# With staging, add a second job. Both environments push to the SAME GitHub
+# repo, so staging's Actions secrets are STAGING_-prefixed (the StaticSite
+# Composition does this) and the caller maps them onto the canonical names:
+#
+#     staging:
+#       if: github.ref_type == 'branch'
+#       uses: bitovi/platform-ci/.github/workflows/static-site-deploy.yml@0.0.1
+#       permissions: { id-token: write, contents: read }
+#       with:
+#         environment: staging
+#         build-dir: out
+#         build-env: |
+#           NEXT_PUBLIC_API_BASE_URL=https://pto-api-staging.bitovi-tools.com
+#       secrets:
+#         SITE_DEPLOY_ROLE_ARN: ${{ secrets.STAGING_SITE_DEPLOY_ROLE_ARN }}
+#         SITE_BUCKET: ${{ secrets.STAGING_SITE_BUCKET }}
+#         CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.STAGING_CLOUDFRONT_DISTRIBUTION_ID }}
+#         # An explicit block replaces `secrets: inherit`, so the account has
+#         # to be mapped through too — it is not environment-specific.
+#         BITOVI_PLATFORM_AWS_ACCOUNT_ID: ${{ secrets.BITOVI_PLATFORM_AWS_ACCOUNT_ID }}
+#
+# Mapping at the call site rather than selecting inside keeps which secret an
+# environment uses visible in the app's own workflow.
+#
+# Promotion: a container release re-tags the exact manifest staging ran. The
+# equivalent here would be copying staging's bucket to production's, but each
+# deploy role is scoped to its own bucket, so that needs a Composition change
+# to widen production's policy with read access to the staging bucket. Until
+# then production rebuilds from the tagged commit. The exposure is smaller
+# than it is for containers — no base image to drift, and `npm ci` builds from
+# the lockfile — but it is not the same byte-for-byte guarantee.
+
+name: Static site deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "production or staging. Selects the convention names and labels the run."
+        required: false
+        type: string
+        default: production
+      app-name:
+        description: "Platform app name. Defaults to the repository name, which is the convention."
+        required: false
+        type: string
+        default: ""
+      build-dir:
+        description: "Directory the build emits (Next export: out; Vite/CRA: dist or build)."
+        required: false
+        type: string
+        default: out
+      install-command:
+        required: false
+        type: string
+        default: npm ci
+      build-command:
+        required: false
+        type: string
+        default: npm run build
+      build-env:
+        description: >
+          Newline-separated KEY=VALUE pairs exported before the build. This is
+          where per-environment build-time config goes — NEXT_PUBLIC_* / VITE_*
+          are inlined into the bundle, so staging needs its own values. Never
+          put secrets here: the bundle is public.
+        required: false
+        type: string
+        default: ""
+      verify-url:
+        description: >
+          URL to poll after deploying, until it serves 200. This is the real
+          "is the site up" check: it exercises DNS, TLS, the distribution, and
+          the content together, from outside. Empty skips it.
+        required: false
+        type: string
+        default: ""
+      verify-timeout-seconds:
+        description: "How long to wait for verify-url to serve 200."
+        required: false
+        type: number
+        default: 300
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      cluster-name:
+        description: "Bucket-name prefix; must match aws.clusterName in charts/platform-api."
+        required: false
+        type: string
+        default: bitovi-platform
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+    secrets:
+      # Role and bucket fall back to the platform naming convention, so a
+      # deploy is not blocked on ESO's first push. The distribution ID has no
+      # convention — CloudFront assigns it — and the deploy policy grants
+      # CreateInvalidation but not ListDistributions, so it cannot be
+      # discovered at runtime either. It is genuinely required.
+      SITE_DEPLOY_ROLE_ARN:
+        required: false
+      SITE_BUCKET:
+        required: false
+      CLOUDFRONT_DISTRIBUTION_ID:
+        required: true
+      BITOVI_PLATFORM_AWS_ACCOUNT_ID:
+        description: >
+          Account hosting the site's bucket and deploy role, used to derive their
+          names when the role and bucket above are absent. A secret rather than
+          an input so it is masked in logs and never written into an app's
+          workflow; org-level, so `secrets: inherit` carries it with no
+          per-caller mapping. The staging example above passes an explicit
+          `secrets:` block, which replaces inheritance — so it maps this through
+          by hand.
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve deploy target
+        id: aws
+        env:
+          SECRET_ROLE: ${{ secrets.SITE_DEPLOY_ROLE_ARN }}
+          SECRET_BUCKET: ${{ secrets.SITE_BUCKET }}
+          DIST: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+          APP: ${{ inputs.app-name }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ACCOUNT: ${{ secrets.BITOVI_PLATFORM_AWS_ACCOUNT_ID }}
+          CLUSTER: ${{ inputs.cluster-name }}
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in
+            production|staging) ;;
+            *) echo "::error::environment must be production or staging, got '$ENVIRONMENT'"; exit 1 ;;
+          esac
+
+          APP="${APP:-${GITHUB_REPOSITORY##*/}}"
+          # Matches $envSite in the StaticSite Composition: the environment
+          # qualifies the app segment of every account-global AWS name.
+          SITE="$APP"
+          [ "$ENVIRONMENT" = "staging" ] && SITE="${APP}-staging"
+
+          # Deriving the names needs the account; the secrets already embed it.
+          # Without this, an unset account composes `arn:aws:iam:::role/...` and
+          # a bucket with an empty segment, failing later as a credentials or
+          # not-found error instead of a missing input.
+          if { [ -z "$SECRET_ROLE" ] || [ -z "$SECRET_BUCKET" ]; } && [ -z "$ACCOUNT" ]; then
+            echo "::error::SITE_DEPLOY_ROLE_ARN/SITE_BUCKET are not set yet, and BITOVI_PLATFORM_AWS_ACCOUNT_ID was not passed, so the convention names cannot be derived."
+            echo "Set the org secret BITOVI_PLATFORM_AWS_ACCOUNT_ID and pass it (secrets: inherit does), or wait for the site's Argo CD Application to push both secrets and re-run."
+            exit 1
+          fi
+
+          ROLE="${SECRET_ROLE:-arn:aws:iam::${ACCOUNT}:role/platform-managed/${SITE}-github-static-site-deploy}"
+          BUCKET="${SECRET_BUCKET:-${CLUSTER}-${ACCOUNT}-${SITE}-static}"
+
+          if [ -z "$DIST" ]; then
+            echo "::error::CLOUDFRONT_DISTRIBUTION_ID is not set for the $ENVIRONMENT environment."
+            echo "ESO pushes it once the CloudFront distribution exists, which is later than the"
+            echo "bucket and role — the distribution has to be created and deployed first. Check"
+            echo "the site's XR (kubectl get staticsite -n <ns>) and re-run once it reports a"
+            echo "distributionID. Unlike the bucket and role this cannot be derived: CloudFront"
+            echo "assigns the ID, and the deploy policy does not grant cloudfront:ListDistributions."
+            exit 1
+          fi
+
+          {
+            echo "role=$ROLE"
+            echo "bucket=$BUCKET"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Deploying $ENVIRONMENT to s3://$BUCKET"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Apply build environment
+        if: inputs.build-env != ''
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          # Appended to $GITHUB_ENV so the build step sees them. Blank lines
+          # and # comments are ignored so the input can be readable YAML.
+          while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            echo "$line" >> "$GITHUB_ENV"
+            echo "set ${line%%=*}"
+          done <<< "$BUILD_ENV"
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.aws.outputs.role }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Sync to S3
+        env:
+          BUILD_DIR: ${{ inputs.build-dir }}
+          BUCKET: ${{ steps.aws.outputs.bucket }}
+        run: |
+          set -euo pipefail
+          test -d "$BUILD_DIR" || { echo "::error::build directory '$BUILD_DIR' does not exist — check build-dir against what the build emits."; exit 1; }
+
+          # Fingerprinted assets are immutable and cached for a year; HTML is
+          # revalidated every request so a deploy is visible immediately even
+          # before the invalidation finishes.
+          aws s3 sync "$BUILD_DIR" "s3://${BUCKET}" \
+            --delete \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "*.html"
+
+          aws s3 sync "$BUILD_DIR" "s3://${BUCKET}" \
+            --delete \
+            --cache-control "public,max-age=0,must-revalidate" \
+            --exclude "*" \
+            --include "*.html"
+
+      # Deliberately after the sync, and deliberately not gated on the
+      # distribution being Deployed. Objects at the origin are useful whether
+      # or not CloudFront has finished propagating, so holding the upload back
+      # would only delay it — and CI cannot check that status anyway
+      # (the deploy policy grants CreateInvalidation, not GetDistribution).
+      # Retried because a just-created distribution can reject briefly.
+      - name: Invalidate CloudFront
+        env:
+          DIST: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if aws cloudfront create-invalidation --distribution-id "$DIST" --paths "/*" >/dev/null; then
+              echo "::notice::Invalidation submitted for $DIST"
+              exit 0
+            fi
+            [ "$attempt" -lt 3 ] && { echo "Invalidation failed (attempt $attempt/3); retrying..."; sleep $((attempt * 10)); }
+          done
+          echo "::error::Could not invalidate $DIST. The objects ARE uploaded — the site will"
+          echo "pick them up once cached copies expire. Check the distribution exists and that"
+          echo "CLOUDFRONT_DISTRIBUTION_ID is current."
+          exit 1
+
+      # The actual readiness gate. Everything above can succeed while the site
+      # is still unreachable: a first-time distribution takes minutes to
+      # propagate, and its DNS alias record is created after it. Rather than
+      # inferring that from AWS state CI cannot read, just ask the site.
+      - name: Verify the site is serving
+        if: inputs.verify-url != ''
+        env:
+          URL: ${{ inputs.verify-url }}
+          DEADLINE: ${{ inputs.verify-timeout-seconds }}
+        run: |
+          set -uo pipefail
+          END=$(( SECONDS + DEADLINE ))
+          attempt=0
+          while [ "$SECONDS" -lt "$END" ]; do
+            attempt=$((attempt + 1))
+            # curl already writes 000 via -w when it cannot connect; `|| true`
+            # keeps its non-zero exit from ending the step (and avoids
+            # appending a second 000 to the captured value).
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$URL" 2>/dev/null || true)
+            CODE=${CODE:-000}
+            if [ "$CODE" = "200" ]; then
+              echo "::notice::$URL served 200 after $attempt attempt(s)."
+              exit 0
+            fi
+            echo "attempt $attempt: $URL -> $CODE"
+            sleep 15
+          done
+          echo "::error::$URL did not serve 200 within ${DEADLINE}s."
+          echo "The upload and invalidation succeeded, so this is the delivery chain, not the"
+          echo "content: a first deploy waits on CloudFront propagation (minutes), the ACM"
+          echo "certificate being ISSUED, and the Route 53 alias record. Check the XR:"
+          echo "  kubectl get staticsite -A"
+          echo "  crossplane trace staticsite <name> -n <namespace>"
+          exit 1

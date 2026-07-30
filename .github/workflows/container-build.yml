@@ -1,0 +1,393 @@
+# Reusable: build a container image, push it to the app's ECR repository, and
+# write the tag into a values file so Argo CD deploys it.
+#
+# This is the STAGING half of the release model (ADR 0005): every merge to an
+# app's main branch builds a SHA-tagged image and points staging at it, so
+# staging continuously runs main. Production never rebuilds — it promotes the
+# digest staging validated, via container-promote.yml.
+#
+# Caller (app repo .github/workflows/deploy.yml):
+#
+#   jobs:
+#     staging:
+#       uses: bitovi/platform-ci/.github/workflows/container-build.yml@0.0.1
+#       permissions:
+#         id-token: write   # OIDC -> AWS
+#         contents: write   # the values write-back commit
+#         actions: write    # cancel the run when there is nothing to deploy
+#       with:
+#         values-file: deploy/values.staging.yaml
+#       secrets: inherit
+#
+# A called workflow cannot elevate permissions, so the caller must grant all
+# three. ECR_PUSH_ROLE_ARN and ECR_REPOSITORY are pushed into the app's repo
+# automatically by ESO (the ContainerApp Composition's CI hand-off).
+#
+# ORDERING: an app should be live in production before it adopts staging /
+# build-on-main. A brand-new app that builds on its first merge races its own
+# provisioning — the ECR repository, push role, and these secrets are created
+# by the Argo Application, which may still be converging. The preflight below
+# fails that case with an explanation instead of a credentials error, and a
+# re-run once the XR is Ready succeeds.
+#
+# Calling this from another repo does not affect the AWS trust policy: for a
+# reusable workflow the OIDC `sub` claim still describes the CALLER
+# (repo:<org>/<app>:ref:refs/heads/main); this workflow appears only in the
+# separate job_workflow_ref claim.
+
+name: Container build and push
+
+on:
+  workflow_call:
+    inputs:
+      values-file:
+        description: "Values file whose image.tag is updated (e.g. deploy/values.staging.yaml)."
+        required: true
+        type: string
+      image-tag:
+        description: "Tag to build and push. Defaults to the triggering commit SHA."
+        required: false
+        type: string
+        default: ""
+      deploy-branch:
+        description: "Branch Argo CD tracks, where the write-back lands."
+        required: false
+        type: string
+        default: main
+      environment-label:
+        description: "Environment name used in the write-back commit message."
+        required: false
+        type: string
+        default: staging
+      build-context:
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      app-name:
+        description: "Platform app name. Defaults to the repository name, which is the convention."
+        required: false
+        type: string
+        default: ""
+      provision-wait-attempts:
+        description: >
+          How many times to poll AWS for the app's push role and ECR
+          repository before giving up. Costs nothing when they already exist —
+          the first probe succeeds.
+        required: false
+        type: number
+        default: 5
+      provision-wait-seconds:
+        description: "Delay between provisioning probes."
+        required: false
+        type: number
+        default: 20
+      image-tag-path:
+        description: >
+          yq path the tag is written to. Defaults to the legacy values format,
+          where image.tag sits at the root. An app interface file keeps the tag
+          on the workload, so those callers pass
+          .workloads.<key>.image.tag — writing to the root there would add a
+          top-level `image` key the interface schema rejects, leaving the
+          workload's own tag empty.
+        required: false
+        type: string
+        default: .image.tag
+      writeback-app-id:
+        description: >
+          GitHub App ID used to mint a token for the values write-back. Needed
+          wherever a ruleset requires pull requests on the deploy branch: such
+          rulesets bypass only OrganizationAdmin and Integration actors, so
+          GITHUB_TOKEN cannot push there and an App token must. Omit to use
+          GITHUB_TOKEN.
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+    secrets:
+      # Not `required`: both fall back to the platform naming convention, so a
+      # build can precede ESO's first push (and works for repos ESO cannot
+      # reach at all).
+      ECR_PUSH_ROLE_ARN:
+        required: false
+      ECR_REPOSITORY:
+        required: false
+      BITOVI_PLATFORM_AWS_ACCOUNT_ID:
+        description: >
+          Account hosting the app's ECR repository and push role, used to derive
+          their names when the two above are absent. A secret rather than an
+          input so it is masked in logs and never written into an app's
+          workflow; org-level, so `secrets: inherit` carries it with no
+          per-caller mapping. A caller passing an explicit `secrets:` block
+          instead of inheriting has to map it through.
+        required: false
+      CI_WRITEBACK_APP_PRIVATE_KEY:
+        description: >
+          Private key for writeback-app-id. Named to match the organization's
+          existing CI_WRITEBACK_APP_ID / CI_WRITEBACK_APP_PRIVATE_KEY pair, so
+          `secrets: inherit` carries it with no per-caller mapping. Required
+          when writeback-app-id is set.
+        required: false
+    outputs:
+      image-tag:
+        description: "The tag that was built and pushed."
+        value: ${{ jobs.build.outputs.image-tag }}
+      image-digest:
+        description: "Digest of the pushed image — the identity production later promotes."
+        value: ${{ jobs.build.outputs.image-digest }}
+
+jobs:
+  build:
+    # Never build a write-back commit ON A BRANCH. Without [skip ci] the app's
+    # own branch-push trigger fires on the commit this workflow just pushed,
+    # and the loop does NOT self-terminate — every write-back is a new SHA, so
+    # it would build forever. Guarding here rather than in the caller means a
+    # caller cannot forget it.
+    #
+    # Scoped to branches deliberately: main's HEAD is usually a write-back
+    # commit, so a release tag frequently points at one. Skipping those too
+    # would recreate the [skip ci] problem this replaced — a tag that silently
+    # never releases.
+    if: ${{ github.ref_type != 'branch' || !contains(github.event.head_commit.message, '[deploy-writeback]') }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image-tag: ${{ steps.resolve.outputs.tag }}
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.image-tag }}
+        run: echo "tag=${REQUESTED:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Resolve the push role and repository. The ESO-pushed secrets win when
+      # present; otherwise fall back to the platform naming convention.
+      #
+      # The fallback is what makes waiting possible at all. Secrets are read
+      # when the run is QUEUED, so a job cannot observe ESO pushing them
+      # mid-run — a loop around `${{ secrets.X }}` would re-read the same
+      # empty string forever. Deriving the names locally lets the probe below
+      # ask AWS, which is live state, and the answer can actually change.
+      # (It also covers apps whose repo is outside the org the platform's
+      # GitHub App is installed on, where ESO can never push at all.)
+      - name: Resolve push role and repository
+        id: aws
+        env:
+          SECRET_ROLE: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          SECRET_REPO: ${{ secrets.ECR_REPOSITORY }}
+          APP: ${{ inputs.app-name }}
+          ACCOUNT: ${{ secrets.BITOVI_PLATFORM_AWS_ACCOUNT_ID }}
+          REGION: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          APP="${APP:-${GITHUB_REPOSITORY##*/}}"
+          # Deriving the names needs the account; the secrets already embed it.
+          # Without this, an unset account composes `arn:aws:iam:::role/...`
+          # and the run fails several steps later looking like a credentials
+          # problem instead of a missing input.
+          if { [ -z "$SECRET_ROLE" ] || [ -z "$SECRET_REPO" ]; } && [ -z "$ACCOUNT" ]; then
+            echo "::error::ECR_PUSH_ROLE_ARN/ECR_REPOSITORY are not set yet, and BITOVI_PLATFORM_AWS_ACCOUNT_ID was not passed, so the convention names cannot be derived."
+            echo "Set the org secret BITOVI_PLATFORM_AWS_ACCOUNT_ID and pass it (secrets: inherit does), or wait for the app's Argo CD Application to push both secrets and re-run."
+            exit 1
+          fi
+          ROLE="${SECRET_ROLE:-arn:aws:iam::${ACCOUNT}:role/platform-managed/${APP}-github-ecr-push}"
+          REPO="${SECRET_REPO:-${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${APP}}"
+          {
+            echo "role=$ROLE"
+            echo "repo=$REPO"
+            echo "repo-name=${REPO##*/}"
+          } >> "$GITHUB_OUTPUT"
+          [ -n "$SECRET_ROLE" ] || echo "::warning::ECR_PUSH_ROLE_ARN is not set; using the convention role $ROLE"
+
+      # Building on every merge removed the barrier that used to hide the
+      # ordering problem: a release tag was always cut long after provisioning
+      # finished, whereas a merge can land while the app's Argo Application is
+      # still converging. Poll until the role is assumable and the repository
+      # exists. When they already do — every case except first-time
+      # provisioning — the first probe succeeds and this costs one API call.
+      - name: Wait for the platform side to finish provisioning
+        env:
+          ROLE: ${{ steps.aws.outputs.role }}
+          REPO_NAME: ${{ steps.aws.outputs.repo-name }}
+          REGION: ${{ inputs.aws-region }}
+          ATTEMPTS: ${{ inputs.provision-wait-attempts }}
+          DELAY: ${{ inputs.provision-wait-seconds }}
+        run: |
+          set -uo pipefail
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            # A fresh token each attempt — they are short-lived, and a long
+            # wait would outlive one issued up front.
+            TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value // empty')
+
+            CREDS=$(aws sts assume-role-with-web-identity \
+              --role-arn "$ROLE" --role-session-name provisioning-probe \
+              --web-identity-token "$TOKEN" \
+              --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+              --output text 2>/dev/null) || CREDS=""
+
+            if [ -n "$CREDS" ]; then
+              read -r AK SK ST <<<"$CREDS"
+              # batch-get-image raises RepositoryNotFoundException when the
+              # repository is missing and succeeds (with an empty result) when
+              # it exists but the tag doesn't — so it probes existence without
+              # needing ecr:DescribeRepositories, which the push policy omits.
+              if AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_SESSION_TOKEN="$ST" \
+                 aws ecr batch-get-image --repository-name "$REPO_NAME" \
+                   --image-ids imageTag=__provisioning_probe__ \
+                   --region "$REGION" >/dev/null 2>&1; then
+                echo "::notice::Push role and ECR repository are ready (attempt $attempt)."
+                exit 0
+              fi
+            fi
+
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then
+              echo "Not provisioned yet (attempt $attempt/$ATTEMPTS); retrying in ${DELAY}s..."
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error::The app's ECR repository or push role does not exist after $ATTEMPTS attempts."
+          echo "Both are created by the app's Argo CD Application. If this is a new app, merge"
+          echo "its gitops/apps/<app>.yaml and wait for the XR to report Ready"
+          echo "(kubectl get containerapp -n <app>), then re-run. Expected role: $ROLE"
+          exit 1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.aws.outputs.role }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: push
+        env:
+          IMAGE: ${{ steps.aws.outputs.repo }}:${{ steps.resolve.outputs.tag }}
+          CONTEXT: ${{ inputs.build-context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          docker build -f "$DOCKERFILE" -t "$IMAGE" "$CONTEXT"
+          docker push "$IMAGE"
+          # Record the digest: promotion re-tags this exact manifest, and the
+          # release check compares it against what production ends up running.
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pushed $IMAGE ($DIGEST)"
+
+  # The write-back is inlined here rather than shared with
+  # container-promote.yml through a composite action: inside a reusable
+  # workflow `uses: ./...` resolves against the CALLER's checkout, so a local
+  # action isn't reachable, and the fully-qualified alternative would pin this
+  # workflow to a fixed tag of its own helper.
+  write-back:
+    needs: [build]
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      # A ruleset that requires pull requests on the deploy branch blocks
+      # GITHUB_TOKEN from pushing; a GitHub App is an Integration bypass actor
+      # and can. Skipped entirely when no app is configured.
+      - name: Mint an App token for the write-back
+        if: inputs.writeback-app-id != ''
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ inputs.writeback-app-id }}
+          private-key: ${{ secrets.CI_WRITEBACK_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.deploy-branch }}
+          # The push below reuses these credentials.
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Write image tag into ${{ inputs.values-file }}
+        env:
+          # Passed as environment, not interpolated into the yq expression —
+          # strenv() keeps the tag data rather than program text.
+          TAG: ${{ needs.build.outputs.image-tag }}
+          TAG_PATH: ${{ inputs.image-tag-path }}
+          FILE: ${{ inputs.values-file }}
+        run: |
+          test -f "$FILE" || { echo "::error::$FILE does not exist on ${{ inputs.deploy-branch }}"; exit 1; }
+          # Check the file has this shape BEFORE writing. yq creates missing
+          # keys rather than failing, so a path meant for another values format
+          # silently adds a new branch and leaves the real tag untouched —
+          # which is exactly how a legacy .image.tag write into an app
+          # interface file produced a stray top-level `image` key and a
+          # workload with no tag. Verifying the value afterwards cannot catch
+          # that: the key it just invented reads back fine. The PARENT is what
+          # must already exist.
+          PARENT="${TAG_PATH%.*}"
+          if ! yq -e "${PARENT}" "$FILE" >/dev/null 2>&1; then
+            echo "::error::$FILE has no ${PARENT}, so writing ${TAG_PATH} would add a new key instead of setting the image tag."
+            echo "Wrong image-tag-path for this file's format? Legacy values use .image.tag; an app interface file uses .workloads.<key>.image.tag."
+            exit 1
+          fi
+          yq -i "${TAG_PATH} = strenv(TAG)" "$FILE"
+
+      - name: Commit and push (rebase-and-retry on races)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          FILE: ${{ inputs.values-file }}
+          BRANCH: ${{ inputs.deploy-branch }}
+          TAG: ${{ needs.build.outputs.image-tag }}
+          ENVIRONMENT: ${{ inputs.environment-label }}
+        run: |
+          if [ -n "${APP_SLUG}" ]; then
+            git config user.name "${APP_SLUG}[bot]"
+            git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fi
+
+          git add "$FILE"
+          if git diff --cached --quiet; then
+            # Already carries this tag — usually a re-run of a successful
+            # deploy. Nothing will reconcile, so don't finish green as if it
+            # did; cancel so the result reads as "nothing happened".
+            echo "::notice::image.tag in $FILE is already $TAG — nothing to deploy; cancelling."
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+            gh run watch "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+            exit 1
+          fi
+
+          # Marked, not [skip ci]. GitHub applies [skip ci] to EVERY event on
+          # the commit, including tag pushes — and since main's HEAD is almost
+          # always a write-back commit, tagging it produced no release run at
+          # all. This marker is ours, so only the guard below reads it.
+          git commit -m "chore(${ENVIRONMENT}): deploy ${TAG} [deploy-writeback]"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${BRANCH}"; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); rebasing and retrying..."
+            git fetch origin "$BRANCH"
+            git rebase "origin/${BRANCH}"
+            sleep $((attempt * 2))
+          done
+          echo "::error::Failed to push the write-back after 5 attempts."
+          exit 1
