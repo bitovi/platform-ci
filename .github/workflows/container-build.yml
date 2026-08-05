@@ -229,17 +229,24 @@ jobs:
           DELAY: ${{ inputs.provision-wait-seconds }}
         run: |
           set -uo pipefail
+          ERR="$(mktemp)"
+          trap 'rm -f "$ERR"' EXIT
           for attempt in $(seq 1 "$ATTEMPTS"); do
             # A fresh token each attempt — they are short-lived, and a long
             # wait would outlive one issued up front.
             TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
               "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value // empty')
 
+            # --region is required even for STS: this step runs BEFORE
+            # configure-aws-credentials, so nothing has set AWS_REGION yet and
+            # the CLI refuses to run without one. Without it every attempt fails
+            # identically to a missing role, and the loop blames provisioning.
             CREDS=$(aws sts assume-role-with-web-identity \
               --role-arn "$ROLE" --role-session-name provisioning-probe \
               --web-identity-token "$TOKEN" \
+              --region "$REGION" \
               --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-              --output text 2>/dev/null) || CREDS=""
+              --output text 2>"$ERR") || CREDS=""
 
             if [ -n "$CREDS" ]; then
               read -r AK SK ST <<<"$CREDS"
@@ -250,7 +257,7 @@ jobs:
               if AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_SESSION_TOKEN="$ST" \
                  aws ecr batch-get-image --repository-name "$REPO_NAME" \
                    --image-ids imageTag=__provisioning_probe__ \
-                   --region "$REGION" >/dev/null 2>&1; then
+                   --region "$REGION" >/dev/null 2>"$ERR"; then
                 echo "::notice::Push role and ECR repository are ready (attempt $attempt)."
                 exit 0
               fi
@@ -262,10 +269,27 @@ jobs:
             fi
           done
 
-          echo "::error::The app's ECR repository or push role does not exist after $ATTEMPTS attempts."
-          echo "Both are created by the app's Argo CD Application. If this is a new app, merge"
-          echo "its gitops/apps/<app>.yaml and wait for the XR to report Ready"
-          echo "(kubectl get containerapp -n <app>), then re-run. Expected role: $ROLE"
+          # The probe cannot tell "role absent" from "assume denied" from "CLI
+          # misconfigured" — they all end with no credentials. Those have
+          # different fixes, so print the last AWS error rather than asserting a
+          # cause. Naming provisioning as the only explanation sent at least one
+          # debugging session after healthy Argo state.
+          echo "::error::Could not assume the push role and reach the ECR repository after $ATTEMPTS attempts."
+          echo "Expected role: $ROLE"
+          echo "Repository:    $REPO_NAME"
+          echo "Last AWS error:"
+          sed 's/^/  /' "$ERR" 2>/dev/null || echo "  (none captured)"
+          echo
+          echo "Most likely causes, in order:"
+          echo "  1. The app is still provisioning. Both the repository and the role come"
+          echo "     from the app's Argo CD Application — for a new app, merge its"
+          echo "     gitops/apps/<app>.yaml and wait for the XR to report Ready"
+          echo "     (kubectl get containerapp -n <app>), then re-run."
+          echo "  2. The role exists but will not accept this token. Check its trust policy"
+          echo "     covers this ref — a tag-triggered run needs refs/tags/*, not just the"
+          echo "     deploy branch — and that the job requests id-token: write."
+          echo "  3. ECR_PUSH_ROLE_ARN points somewhere else. Confirm the value the app's"
+          echo "     PushSecret wrote matches the role above."
           exit 1
 
       - name: Configure AWS credentials (OIDC)
