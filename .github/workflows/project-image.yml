@@ -40,10 +40,12 @@
 #
 # THE WRITE-BACK writes `images.<image>.tag` in `values-file`, quoted, so a
 # tag such as 1e45678 stays a string. It writes nothing when the deploy branch
-# already has code newer than the built commit (outside the overlay's
-# folder): that code's own run deploys it, and a re-run of an old run must not
-# move the cluster back. The commit carries [deploy-writeback]; this workflow
-# does not build such a commit.
+# already has code newer than the built commit (commits outside the overlay's
+# folder, other than write-backs): that code's own run deploys it, and a
+# re-run of an old run must not move the cluster back. It checks again after
+# each rebase when a push is rejected, and gives way to a write-back that
+# changed the same file first. The commit carries [deploy-writeback]; this
+# workflow does not build such a commit.
 
 name: Project image
 
@@ -186,28 +188,11 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token || github.token }}
 
-      - name: Write the tag into ${{ inputs.values-file }}
-        id: write
+      # One step, so the staleness check runs again after every rebase: a
+      # push is rejected exactly when the branch has moved.
+      - name: Write the tag into ${{ inputs.values-file }} and push
         env:
           SHA: ${{ github.sha }}
-          FILE: ${{ inputs.values-file }}
-          KEY: ${{ inputs.image }}
-          TAG: ${{ needs.build.outputs.tag }}
-        run: |
-          set -euo pipefail
-          if ! git merge-base --is-ancestor "$SHA" HEAD; then
-            echo "::notice::$SHA is not on this branch; not deploying it."; exit 0
-          fi
-          if ! git diff --quiet "$SHA" HEAD -- . ":(exclude)$(dirname "$FILE")"; then
-            echo "::notice::Newer code is on this branch; its own run deploys it."; exit 0
-          fi
-          yq -e '.images[strenv(KEY)]' "$FILE" >/dev/null 2>&1 || { echo "::error::$FILE has no images.$KEY"; exit 1; }
-          yq -i '.images[strenv(KEY)].tag = strenv(TAG) | .images[strenv(KEY)].tag style="double"' "$FILE"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-
-      - name: Commit and push
-        if: steps.write.outputs.changed == 'true'
-        env:
           FILE: ${{ inputs.values-file }}
           BRANCH: ${{ inputs.deploy-branch }}
           KEY: ${{ inputs.image }}
@@ -215,6 +200,23 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
+          set -euo pipefail
+          # Code newer than the built commit, outside the overlay's folder.
+          # Write-back commits are not code: another environment's write-back
+          # must not stop this one.
+          newer() {
+            [ -n "$(git log --format=%H --invert-grep -F --grep='[deploy-writeback]' \
+              "$SHA..HEAD" -- . ":(exclude)$(dirname "$FILE")")" ]
+          }
+          if ! git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "::notice::$SHA is not on this branch; not deploying it."; exit 0
+          fi
+          if newer; then
+            echo "::notice::Newer code is on this branch; its own run deploys it."; exit 0
+          fi
+          yq -e '.images[strenv(KEY)]' "$FILE" >/dev/null 2>&1 || { echo "::error::$FILE has no images.$KEY"; exit 1; }
+          yq -i '.images[strenv(KEY)].tag = strenv(TAG) | .images[strenv(KEY)].tag style="double"' "$FILE"
+
           if [ -n "$APP_SLUG" ]; then
             git config user.name "${APP_SLUG}[bot]"
             git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
@@ -225,10 +227,18 @@ jobs:
           git add "$FILE"
           git diff --cached --quiet && { echo "::notice::$FILE already runs $TAG."; exit 0; }
           git commit -m "chore(${ENVIRONMENT}): deploy ${KEY} ${TAG} [deploy-writeback]"
+
           for attempt in 1 2 3 4 5; do
             git push origin "HEAD:${BRANCH}" && exit 0
-            git fetch origin "$BRANCH" && git rebase "origin/${BRANCH}"
             sleep $((attempt * 2))
+            git fetch origin "$BRANCH"
+            if ! git rebase "origin/${BRANCH}"; then
+              git rebase --abort
+              echo "::notice::Another write-back changed $FILE first; not deploying $TAG over it."; exit 0
+            fi
+            if newer; then
+              echo "::notice::Newer code landed during the push; its own run deploys it."; exit 0
+            fi
           done
           echo "::error::Failed to push the write-back after 5 attempts."
           exit 1
