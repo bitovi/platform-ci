@@ -1,0 +1,175 @@
+# Reusable: build one static site of a repo on the platform's Project API,
+# sync it to the site's bucket and invalidate its CloudFront distribution.
+# The sync is the deploy; Argo CD is not in the path.
+#
+# For the Project API only. Apps on the app interface use
+# static-site-deploy.yml.
+#
+# Caller (app repo, for example .github/workflows/dev.yml):
+#
+#   on:
+#     push:
+#       branches: [master]
+#     workflow_dispatch:
+#   jobs:
+#     web:
+#       uses: bitovi/platform-ci/.github/workflows/project-site.yml@v0.0.4
+#       permissions:
+#         id-token: write   # OIDC -> AWS
+#         contents: read
+#       with:
+#         environment: dev
+#         site: web
+#         build-dir: out
+#         build-env: |
+#           NEXT_PUBLIC_API_BASE_URL=https://pto-api.dev.bitovi-tools.com
+#       secrets: inherit
+#
+# WHERE THE CREDENTIALS COME FROM: the platform writes the repo's CI values
+# into the GitHub environment named by `environment`: ECR_PUSH_ROLE_ARN (the
+# repo's CI role, which also deploys its sites), SITE_BUCKET_<SITE> and
+# DISTRIBUTION_ID_<SITE>, where <SITE> is the site's workload key in capitals
+# with dashes as underscores. Where the platform's GitHub App cannot reach the
+# repo, set the same names by hand from the Project's status.
+#
+# THE GUARD: a missing environment secret falls back to a repo-level secret
+# of the same name. So the job refuses a role outside the environment's IAM
+# path (/bcp/<environment>/ by default) and a bucket that is not the site's
+# (<prefix>-<project>-<site>-site).
+
+name: Project site
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub environment holding the platform's CI values, such as dev."
+        required: true
+        type: string
+      site:
+        description: "The site's workload key in the values file, such as web."
+        required: true
+        type: string
+      build-dir:
+        description: "The folder the build writes, such as out or dist."
+        required: true
+        type: string
+      build-env:
+        description: "KEY=value lines set for the build, such as NEXT_PUBLIC_* settings."
+        required: false
+        type: string
+        default: ""
+      install-command:
+        required: false
+        type: string
+        default: npm ci
+      build-command:
+        required: false
+        type: string
+        default: npm run build
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      cache-dependency-path:
+        description: "Lock file(s) for the npm cache, for a build outside the repo root."
+        required: false
+        type: string
+        default: ""
+      iam-path:
+        description: "IAM path the CI role must be under. Default /bcp/<environment>/."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name the secrets
+        id: names
+        env:
+          SITE: ${{ inputs.site }}
+        run: |
+          KEY=$(tr '[:lower:]-' '[:upper:]_' <<<"$SITE")
+          echo "bucket=SITE_BUCKET_${KEY}" >> "$GITHUB_OUTPUT"
+          echo "distribution=DISTRIBUTION_ID_${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse any target but this environment's
+        env:
+          ROLE: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          BUCKET: ${{ secrets[steps.names.outputs.bucket] }}
+          DIST: ${{ secrets[steps.names.outputs.distribution] }}
+          NAMES: ${{ steps.names.outputs.bucket }} and ${{ steps.names.outputs.distribution }}
+          SITE: ${{ inputs.site }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IAM_PATH: ${{ inputs.iam-path }}
+        run: |
+          IAM_PATH="${IAM_PATH:-/bcp/${ENVIRONMENT}/}"
+          case "$ROLE" in
+            arn:aws:iam::*:role${IAM_PATH}*-ci) ;;
+            *) echo "::error::ECR_PUSH_ROLE_ARN is not a CI role under ${IAM_PATH}. Are the ${ENVIRONMENT} environment's values set?"; exit 1 ;;
+          esac
+          case "$BUCKET" in
+            *-"$SITE"-site) ;;
+            *) echo "::error::$NAMES must be set in the ${ENVIRONMENT} environment; the bucket must be site ${SITE}'s."; exit 1 ;;
+          esac
+          [ -n "$DIST" ] || { echo "::error::$NAMES must be set in the ${ENVIRONMENT} environment."; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: Install
+        run: ${{ inputs.install-command }}
+
+      - name: Apply the build environment
+        if: inputs.build-env != ''
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            echo "$line" >> "$GITHUB_ENV"
+            echo "set ${line%%=*}"
+          done <<< "$BUILD_ENV"
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # Hashed assets are cached for a year; HTML is always revalidated.
+      - name: Sync files
+        env:
+          BUCKET: ${{ secrets[steps.names.outputs.bucket] }}
+          BUILD_DIR: ${{ inputs.build-dir }}
+        run: |
+          aws s3 sync "$BUILD_DIR" "s3://$BUCKET" --delete \
+            --cache-control "public,max-age=31536000,immutable" --exclude "*.html"
+          aws s3 sync "$BUILD_DIR" "s3://$BUCKET" --delete \
+            --cache-control "public,max-age=0,must-revalidate" --exclude "*" --include "*.html"
+
+      - name: Invalidate the CDN
+        env:
+          DIST: ${{ secrets[steps.names.outputs.distribution] }}
+        run: aws cloudfront create-invalidation --distribution-id "$DIST" --paths "/*" >/dev/null
