@@ -22,6 +22,13 @@ write-back App key as Actions secrets.
 | `container-build.yml` | Build an image, push it to the app's ECR repository, and write the tag into a values file so Argo CD deploys it. |
 | `container-promote.yml` | Promote the image an environment already validated by re-tagging that exact manifest — no rebuild — then write the tag into the target values file. |
 | `static-site-deploy.yml` | Build a static site, sync it to its S3 bucket, and invalidate CloudFront. The sync is the deploy; Argo CD is not in the path. |
+| `project-image.yml` | Project API: build one image, push it to its ECR repository and write the tag into the repo's overlay for the cluster. Reads the CI values from the cluster's GitHub environment. |
+| `project-site.yml` | Project API: build one static site, sync it to its bucket and invalidate its distribution. Reads the CI values from the cluster's GitHub environment. |
+
+The `project-*` workflows are for repos on the platform's Project API. Their
+job runs in a GitHub environment (such as `dev`), where the platform writes
+the repo's CI values, and refuses any role or target outside that
+environment's IAM path.
 
 Each file's header documents its full contract: every input, what the caller
 must grant, and the failure modes worth knowing about.

@@ -1,0 +1,244 @@
+# Reusable: build one image of a repo on the platform's Project API, push it
+# to that image's ECR repository, and write the tag into the repo's overlay
+# for the cluster, so Argo CD deploys it.
+#
+# For the Project API only. Apps on the app interface use container-build.yml.
+#
+# Caller (app repo, for example .github/workflows/dev.yml):
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths-ignore: ["deploy/**"]   # the write-back commit builds nothing
+#     workflow_dispatch:
+#   jobs:
+#     server:
+#       uses: bitovi/platform-ci/.github/workflows/project-image.yml@v0.0.4
+#       permissions:
+#         id-token: write   # OIDC -> AWS
+#         contents: write   # the write-back commit
+#       with:
+#         environment: dev
+#         image: server
+#         values-file: deploy/next/dev.yaml
+#         writeback-app-id: ${{ vars.CI_WRITEBACK_APP_ID }}
+#       secrets: inherit
+#
+# WHERE THE CREDENTIALS COME FROM: the platform writes the repo's CI values
+# into the GitHub environment named by `environment` (the cluster profile's
+# github.environment): ECR_PUSH_ROLE_ARN and ECR_REPOSITORY_<IMAGE>, where
+# <IMAGE> is the image key in capitals with dashes as underscores. The build
+# job runs in that environment, so it reads them; the CI role trusts only
+# jobs in that environment (and builds on main). Create the environment, with
+# its deployment branches limited to the deploy branch, before the first run.
+#
+# THE GUARD: a missing environment secret falls back to a repo-level secret
+# of the same name. Repos that also run on the old platform hold production's
+# ECR_PUSH_ROLE_ARN there. So the build refuses a role outside the
+# environment's IAM path (/bcp/<environment>/ by default) and a repository
+# that is not <project>/<image>. It never derives names by convention.
+#
+# THE WRITE-BACK writes `images.<image>.tag` in `values-file`, quoted, so a
+# tag such as 1e45678 stays a string. It writes nothing when the deploy branch
+# already has code newer than the built commit (commits outside the overlay's
+# folder, other than write-backs): that code's own run deploys it, and a
+# re-run of an old run must not move the cluster back. It checks again after
+# each rebase when a push is rejected, and gives way to a write-back that
+# changed the same file first. The commit carries [deploy-writeback]; this
+# workflow does not build such a commit.
+
+name: Project image
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub environment holding the platform's CI values, such as dev."
+        required: true
+        type: string
+      image:
+        description: "The image's key under `images:` in the values file, such as server."
+        required: true
+        type: string
+      values-file:
+        description: "The overlay the tag is written into, such as deploy/next/dev.yaml."
+        required: true
+        type: string
+      iam-path:
+        description: "IAM path the CI role must be under. Default /bcp/<environment>/."
+        required: false
+        type: string
+        default: ""
+      build-context:
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+      deploy-branch:
+        description: "Branch Argo CD reads, where the write-back lands."
+        required: false
+        type: string
+        default: main
+      writeback-app-id:
+        description: >
+          GitHub App ID for the write-back push. Needed where a ruleset
+          requires pull requests on the deploy branch. Omit to use
+          GITHUB_TOKEN.
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+    secrets:
+      CI_WRITEBACK_APP_PRIVATE_KEY:
+        description: "Private key for writeback-app-id."
+        required: false
+    outputs:
+      image-tag:
+        description: "The tag that was built and pushed."
+        value: ${{ jobs.build.outputs.tag }}
+
+jobs:
+  build:
+    if: ${{ github.ref_type != 'branch' || !contains(github.event.head_commit.message, '[deploy-writeback]') }}
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      tag: ${{ steps.push.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name the secrets
+        id: names
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          KEY=$(tr '[:lower:]-' '[:upper:]_' <<<"$IMAGE")
+          echo "repository=ECR_REPOSITORY_${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse any target but this environment's
+        env:
+          ROLE: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          REPO: ${{ secrets[steps.names.outputs.repository] }}
+          REPO_SECRET: ${{ steps.names.outputs.repository }}
+          IMAGE: ${{ inputs.image }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IAM_PATH: ${{ inputs.iam-path }}
+        run: |
+          IAM_PATH="${IAM_PATH:-/bcp/${ENVIRONMENT}/}"
+          case "$ROLE" in
+            arn:aws:iam::*:role${IAM_PATH}*-ci) ;;
+            *) echo "::error::ECR_PUSH_ROLE_ARN is not a CI role under ${IAM_PATH}. Has the platform written the ${ENVIRONMENT} environment's values yet?"; exit 1 ;;
+          esac
+          case "$REPO" in
+            *.dkr.ecr.*.amazonaws.com/*/"$IMAGE") ;;
+            *) echo "::error::${REPO_SECRET} is not set in the ${ENVIRONMENT} environment, or is not an ECR repository for image ${IMAGE}."; exit 1 ;;
+          esac
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: push
+        env:
+          REPO: ${{ secrets[steps.names.outputs.repository] }}
+          CONTEXT: ${{ inputs.build-context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          docker build -f "$DOCKERFILE" -t "$REPO:$TAG" "$CONTEXT"
+          docker push "$REPO:$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pushed $REPO:$TAG"
+
+  write-back:
+    needs: [build]
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+    steps:
+      - name: Mint an App token for the write-back
+        if: inputs.writeback-app-id != ''
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ inputs.writeback-app-id }}
+          private-key: ${{ secrets.CI_WRITEBACK_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.deploy-branch }}
+          # The whole history, to compare the built commit with the branch.
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      # One step, so the staleness check runs again after every rebase: a
+      # push is rejected exactly when the branch has moved.
+      - name: Write the tag into ${{ inputs.values-file }} and push
+        env:
+          SHA: ${{ github.sha }}
+          FILE: ${{ inputs.values-file }}
+          BRANCH: ${{ inputs.deploy-branch }}
+          KEY: ${{ inputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          # Code newer than the built commit, outside the overlay's folder.
+          # Write-back commits are not code: another environment's write-back
+          # must not stop this one.
+          newer() {
+            [ -n "$(git log --format=%H --invert-grep -F --grep='[deploy-writeback]' \
+              "$SHA..HEAD" -- . ":(exclude)$(dirname "$FILE")")" ]
+          }
+          if ! git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "::notice::$SHA is not on this branch; not deploying it."; exit 0
+          fi
+          if newer; then
+            echo "::notice::Newer code is on this branch; its own run deploys it."; exit 0
+          fi
+          yq -e '.images[strenv(KEY)]' "$FILE" >/dev/null 2>&1 || { echo "::error::$FILE has no images.$KEY"; exit 1; }
+          yq -i '.images[strenv(KEY)].tag = strenv(TAG) | .images[strenv(KEY)].tag style="double"' "$FILE"
+
+          if [ -n "$APP_SLUG" ]; then
+            git config user.name "${APP_SLUG}[bot]"
+            git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fi
+          git add "$FILE"
+          git diff --cached --quiet && { echo "::notice::$FILE already runs $TAG."; exit 0; }
+          git commit -m "chore(${ENVIRONMENT}): deploy ${KEY} ${TAG} [deploy-writeback]"
+
+          for attempt in 1 2 3 4 5; do
+            git push origin "HEAD:${BRANCH}" && exit 0
+            sleep $((attempt * 2))
+            git fetch origin "$BRANCH"
+            if ! git rebase "origin/${BRANCH}"; then
+              git rebase --abort
+              echo "::notice::Another write-back changed $FILE first; not deploying $TAG over it."; exit 0
+            fi
+            if newer; then
+              echo "::notice::Newer code landed during the push; its own run deploys it."; exit 0
+            fi
+          done
+          echo "::error::Failed to push the write-back after 5 attempts."
+          exit 1
